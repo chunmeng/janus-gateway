@@ -499,6 +499,7 @@ typedef struct janus_streaming_session {
 	gboolean stopping;
 	volatile gint hangingup;
 	gint64 destroyed;	/* Time at which this session was marked as destroyed */
+	gboolean sps_sent;
 } janus_streaming_session;
 static GHashTable *sessions;
 static GList *old_sessions;
@@ -1151,6 +1152,7 @@ void janus_streaming_create_session(janus_plugin_session *handle, int *error) {
 	session->started = FALSE;	/* This will happen later */
 	session->paused = FALSE;
 	session->destroyed = 0;
+	session->sps_sent = FALSE;
 	g_atomic_int_set(&session->hangingup, 0);
 	handle->plugin_handle = session;
 	janus_mutex_lock(&sessions_mutex);
@@ -3386,13 +3388,13 @@ static int janus_streaming_rtsp_connect_to_server(janus_streaming_mountpoint *mp
 	mp->codecs.audio_pt = doaudio ? apt : -1;
 	g_free(mp->codecs.audio_rtpmap);
 	g_free(mp->codecs.audio_fmtp);
-	mp->codecs.audio_rtpmap = doaudio ? g_strdup(artpmap) : NULL;
-	mp->codecs.audio_fmtp = doaudio ? g_strdup(afmtp) : NULL;
+	mp->codecs.audio_rtpmap = doaudio ? g_strdup("PCMU/8000") : NULL;
+	mp->codecs.audio_fmtp = NULL; // doaudio ? g_strdup(afmtp) : NULL;
 	mp->codecs.video_pt = dovideo ? vpt : -1;
 	g_free(mp->codecs.video_rtpmap);
 	g_free(mp->codecs.video_fmtp);
 	mp->codecs.video_rtpmap = dovideo ? g_strdup(vrtpmap) : NULL;
-	mp->codecs.video_fmtp = dovideo ? g_strdup(vfmtp) : NULL;
+	mp->codecs.video_fmtp = dovideo ? g_strdup("packetization-mode=1;profile-level-id=42e01f;sprop-parameter-sets=Z0IAKOkAoAty,aM4xUg==") : NULL;
 	source->audio_fd = audio_fds.fd;
 	source->audio_rtcp_fd = audio_fds.rtcp_fd;
 	source->video_fd = video_fds.fd;
@@ -4101,11 +4103,11 @@ static void *janus_streaming_relay_thread(void *data) {
 					/* Do we have a new stream? */
 					if(ntohl(packet.data->ssrc) != v_last_ssrc) {
 						v_last_ssrc = ntohl(packet.data->ssrc);
-						JANUS_LOG(LOG_INFO, "[%s] New video stream! (ssrc=%u)\n", name, v_last_ssrc);
 						v_base_ts_prev = v_last_ts;
 						v_base_ts = ntohl(packet.data->timestamp);
 						v_base_seq_prev = v_last_seq;
 						v_base_seq = ntohs(packet.data->seq_number);
+						JANUS_LOG(LOG_INFO, "[%s] New video stream! (ssrc=%u, prev[%u,%u]->[%u,%u])\n", name, v_last_ssrc, v_base_seq_prev, v_base_ts_prev, v_base_seq, v_base_ts);
 					}
 					v_last_ts = (ntohl(packet.data->timestamp)-v_base_ts)+v_base_ts_prev+4500;	/* FIXME We're assuming 15fps here... */
 					packet.data->timestamp = htonl(v_last_ts);
@@ -4217,8 +4219,20 @@ static void janus_streaming_relay_rtp_packet(gpointer data, gpointer user_data) 
 	if(packet->is_rtp) {
 		/* Make sure there hasn't been a publisher switch by checking the SSRC */
 		if(packet->is_video) {
+			if (ntohl(packet->data->ssrc) != session->context.v_last_ssrc) // New session
+				session->sps_sent = FALSE;
 			/* Fix sequence number and timestamp (switching may be involved) */
 			janus_rtp_header_update(packet->data, &session->context, TRUE, 4500);
+			if (session->sps_sent == FALSE) {
+				rtp_header *rtp = (rtp_header *)packet->data; // Look into the frame
+				unsigned char *head = (unsigned char *)rtp->csrc;
+				unsigned char type = (head[0] & 0x1F);
+				if (type != 7) { JANUS_LOG(LOG_INFO, "skip %u\n", rtp->seq_number); return; }
+				session->sps_sent = TRUE; // else proceed and let the rtp through
+				JANUS_LOG(LOG_INFO, "===>>> Session 1st RTP packet is %s: len=%u, seq=%u, ts=%u %02x %02x %02x %02x\n",
+						((rtp->csrc[0] & 0x1F)==7)?"SPS":"I", packet->length, rtp->seq_number, rtp->timestamp, head[0], head[1], head[2], head[3]);
+			}
+
 			if(gateway != NULL)
 				gateway->relay_rtp(session->handle, packet->is_video, (char *)packet->data, packet->length);
 			/* Restore the timestamp and sequence number to what the publisher set them to */
